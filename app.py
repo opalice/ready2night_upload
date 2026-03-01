@@ -9,8 +9,34 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Optional
 
+try:
+    import boto3  # type: ignore
+except Exception:
+    boto3 = None
+
 from flask import Flask, request, jsonify
 from werkzeug.utils import secure_filename
+
+
+def load_local_env_file(path: Path) -> None:
+    try:
+        if not path.exists():
+            return
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = key.strip()
+            if not key:
+                continue
+            val = val.strip().strip('"').strip("'")
+            os.environ.setdefault(key, val)
+    except Exception:
+        pass
+
+
+load_local_env_file(Path("/home/r2n/apps/upload-api-v1/.env"))
 
 APP_ROOT = Path(os.environ.get("UPLOAD_API_ROOT", "/home/r2n/apps/upload-api-v1")).resolve()
 STORAGE_RAW = Path(os.environ.get("UPLOAD_API_STORAGE_RAW", str(APP_ROOT / "storage" / "raw"))).resolve()
@@ -25,6 +51,14 @@ CWEBP_BIN = os.environ.get("UPLOAD_API_CWEBP_BIN", "cwebp").strip() or "cwebp"
 MAX_FILE_MB = int(os.environ.get("UPLOAD_API_MAX_FILE_MB", "512"))
 POLL_INTERVAL = float(os.environ.get("UPLOAD_API_POLL_INTERVAL", "0.7"))
 
+R2_PUBLIC_BASE = os.environ.get("R2_PUBLIC_BASE", "https://static.ready2night.be").strip() or "https://static.ready2night.be"
+R2_BUCKET = os.environ.get("R2_BUCKET", "").strip()
+R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "").strip()
+R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "").strip()
+R2_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", os.environ.get("R2_ACCOUNT_ID", "")).strip()
+R2_S3_ENDPOINT = os.environ.get("R2_S3_ENDPOINT", "").strip() or (f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com" if R2_ACCOUNT_ID else "")
+R2_CACHE_CONTROL = os.environ.get("UPLOAD_API_R2_CACHE_CONTROL", "public, max-age=31536000, immutable").strip()
+
 for d in [STORAGE_RAW, STORAGE_WORK, STORAGE_TMP, STATIC_EVENTS_ROOT.parent, DB_PATH.parent]:
     d.mkdir(parents=True, exist_ok=True)
 
@@ -33,6 +67,7 @@ app.config["MAX_CONTENT_LENGTH"] = MAX_FILE_MB * 1024 * 1024
 _db_lock = threading.Lock()
 _wake_event = threading.Event()
 _worker_started = False
+_r2_client = None
 
 
 def now_iso() -> str:
@@ -180,6 +215,59 @@ def encode_webp(input_path: Path, output_path: Path, quality: int = 82) -> None:
     run_cmd(["convert", str(input_path), str(output_path)])
 
 
+def r2_is_enabled() -> bool:
+    return bool(R2_BUCKET and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_S3_ENDPOINT)
+
+
+def get_r2_client():
+    global _r2_client
+    if not r2_is_enabled():
+        raise RuntimeError("r2_not_configured")
+    if boto3 is None:
+        raise RuntimeError("boto3_not_installed")
+    if _r2_client is None:
+        _r2_client = boto3.client(
+            "s3",
+            endpoint_url=R2_S3_ENDPOINT,
+            aws_access_key_id=R2_ACCESS_KEY_ID,
+            aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+            region_name="auto",
+        )
+    return _r2_client
+
+
+def path_to_object_key(path: Path) -> str:
+    rel = path.resolve().relative_to(STATIC_PUBLIC_ROOT)
+    return str(rel).replace(os.sep, "/")
+
+
+def to_public_url(path: Path) -> str:
+    key = path_to_object_key(path)
+    return f"{R2_PUBLIC_BASE.rstrip('/')}/{key.lstrip('/')}"
+
+
+def publish_file(path: Path, content_type: str) -> str:
+    key = path_to_object_key(path)
+    if r2_is_enabled():
+        client = get_r2_client()
+        with path.open("rb") as fh:
+            client.put_object(
+                Bucket=R2_BUCKET,
+                Key=key,
+                Body=fh,
+                ContentType=content_type,
+                CacheControl=R2_CACHE_CONTROL,
+            )
+    return f"{R2_PUBLIC_BASE.rstrip('/')}/{key.lstrip('/')}"
+
+
+def safe_unlink(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def insert_event(conn: sqlite3.Connection, job_id: str, phase: str, message: str, current: int, total: int, file_name: str = "") -> None:
     conn.execute(
         """
@@ -208,12 +296,6 @@ def build_output_paths(room_slug: str, album_folder: str, short_id: str) -> Dict
     }
 
 
-def to_public_url(path: Path) -> str:
-    path = path.resolve()
-    rel = path.relative_to(STATIC_PUBLIC_ROOT)
-    return f"https://static.ready2night.be/{str(rel).replace(os.sep, '/')}"
-
-
 def process_image(input_path: Path, outputs: Dict[str, Path]) -> Dict[str, str]:
     tmp_png = STORAGE_TMP / f"img_{uuid.uuid4().hex[:12]}.png"
     try:
@@ -234,16 +316,17 @@ def process_image(input_path: Path, outputs: Dict[str, Path]) -> Dict[str, str]:
         except Exception:
             avif_ok = False
 
-        result = {"url": to_public_url(outputs["webp"]), "webpUrl": to_public_url(outputs["webp"]), "posterUrl": "", "avifUrl": ""}
+        webp_url = publish_file(outputs["webp"], "image/webp")
+        avif_url = ""
         if avif_ok and outputs["avif"].exists():
-            result["avifUrl"] = to_public_url(outputs["avif"])
-            result["url"] = result["avifUrl"]
+            avif_url = publish_file(outputs["avif"], "image/avif")
+
+        result = {"url": avif_url or webp_url, "webpUrl": webp_url, "posterUrl": "", "avifUrl": avif_url}
         return result
     finally:
-        try:
-            tmp_png.unlink(missing_ok=True)
-        except Exception:
-            pass
+        safe_unlink(tmp_png)
+        safe_unlink(outputs["webp"])
+        safe_unlink(outputs["avif"])
 
 
 def process_video(input_path: Path, outputs: Dict[str, Path]) -> Dict[str, str]:
@@ -265,7 +348,11 @@ def process_video(input_path: Path, outputs: Dict[str, Path]) -> Dict[str, str]:
             tmp_poster.unlink(missing_ok=True)
         except Exception:
             pass
-    return {"url": to_public_url(outputs["mp4"]), "webpUrl": "", "avifUrl": "", "posterUrl": to_public_url(outputs["poster"])}
+    mp4_url = publish_file(outputs["mp4"], "video/mp4")
+    poster_url = publish_file(outputs["poster"], "image/webp")
+    safe_unlink(outputs["mp4"])
+    safe_unlink(outputs["poster"])
+    return {"url": mp4_url, "webpUrl": "", "avifUrl": "", "posterUrl": poster_url}
 
 
 def process_file(row: sqlite3.Row, room_slug: str, album_folder: str) -> Dict[str, str]:
