@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+upload_api.sqlite3
+storage/
+logs/
+tmp/
+venv/
+.venv/
